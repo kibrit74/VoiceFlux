@@ -2,26 +2,36 @@ import os
 import re
 import time
 import random
+import logging
 from flask import Flask, render_template, request, jsonify, send_file, url_for
 from werkzeug.utils import secure_filename
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, TooManyRequests
 import google.generativeai as genai
 from gtts import gTTS
-from functools import wraps, lru_cache
+from functools import wraps
+from cachetools import TTLCache, cached
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
-# Google Gemini API anahtarınızı buraya ekleyin
+# Logging ayarları
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Google Gemini API anahtarını çevresel değişkenlerden alın
 genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
 
 # Geçici ses dosyaları için dizin
 TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
-def exponential_backoff(attempt):
-    return min(300, (2 ** attempt) + random.random())
+# Önbellek ayarları
+transcript_cache = TTLCache(maxsize=1000, ttl=3600)  # 1 saat süreyle 1000 öğe sakla
 
-def retry_with_backoff(retries=3):
+def exponential_backoff(attempt, base_delay=5, max_delay=300):
+    delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+    return delay
+
+def retry_with_backoff(retries=5):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -30,9 +40,10 @@ def retry_with_backoff(retries=3):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == retries - 1:
+                        logger.error(f"Final attempt failed: {e}")
                         raise e
                     wait_time = exponential_backoff(attempt)
-                    print(f"Attempt {attempt + 1} failed. Waiting for {wait_time:.2f} seconds.")
+                    logger.warning(f"Attempt {attempt + 1} failed. Waiting for {wait_time:.2f} seconds.")
                     time.sleep(wait_time)
         return wrapper
     return decorator
@@ -42,18 +53,22 @@ def extract_video_id(url):
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
-@retry_with_backoff(retries=3)
-@lru_cache(maxsize=100)
+@retry_with_backoff(retries=5)
+@cached(cache=transcript_cache)
 def get_youtube_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return ' '.join([entry['text'] for entry in transcript])
     except TranscriptsDisabled:
-        print(f"Video {video_id} için transkript devre dışı bırakılmış.")
+        logger.warning(f"Video {video_id} için transkript devre dışı bırakılmış.")
     except NoTranscriptFound:
-        print(f"Video {video_id} için transkript bulunamadı.")
+        logger.warning(f"Video {video_id} için transkript bulunamadı.")
+    except VideoUnavailable:
+        logger.warning(f"Video {video_id} mevcut değil veya özel.")
+    except TooManyRequests:
+        logger.error("YouTube API istek limitine ulaşıldı.")
     except Exception as e:
-        print(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
+        logger.error(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
     return None
 
 def translate_text(text, target_language):
@@ -96,13 +111,13 @@ def text_to_speech(text, output_file, target_language):
     tts = gTTS(text=text, lang=lang_code)
     file_path = os.path.join(TEMP_AUDIO_DIR, output_file)
     tts.save(file_path)
-    print(f"Ses dosyası {file_path} olarak kaydedildi.")
+    logger.info(f"Ses dosyası {file_path} olarak kaydedildi.")
     
     if os.path.exists(file_path):
-        print(f"Dosya başarıyla oluşturuldu: {file_path}")
-        print(f"Dosya boyutu: {os.path.getsize(file_path)} bytes")
+        logger.info(f"Dosya başarıyla oluşturuldu: {file_path}")
+        logger.info(f"Dosya boyutu: {os.path.getsize(file_path)} bytes")
     else:
-        print(f"Hata: Dosya oluşturulamadı: {file_path}")
+        logger.error(f"Hata: Dosya oluşturulamadı: {file_path}")
     
     return file_path
 
@@ -129,9 +144,9 @@ def translate():
             
             full_audio_path = os.path.join(app.root_path, 'static', 'temp_audio', audio_filename)
             if os.path.exists(full_audio_path):
-                print(f"Ses dosyası mevcut: {full_audio_path}")
+                logger.info(f"Ses dosyası mevcut: {full_audio_path}")
             else:
-                print(f"Hata: Ses dosyası bulunamadı: {full_audio_path}")
+                logger.error(f"Hata: Ses dosyası bulunamadı: {full_audio_path}")
             
             return jsonify({
                 'video_id': video_id,
@@ -139,7 +154,7 @@ def translate():
                 'target_language': target_language
             })
         except Exception as e:
-            print(f"Çeviri veya ses dönüşümü hatası: {e}")
+            logger.error(f"Çeviri veya ses dönüşümü hatası: {e}")
             return jsonify({'error': 'Çeviri işlemi sırasında bir hata oluştu'}), 500
     else:
         return jsonify({'error': 'Transkript alınamadı veya video altyazı içermiyor'}), 500
@@ -148,10 +163,10 @@ def translate():
 def serve_audio(filename):
     file_path = os.path.join(TEMP_AUDIO_DIR, filename)
     if os.path.exists(file_path):
-        print(f"Serving audio file: {file_path}")
+        logger.info(f"Serving audio file: {file_path}")
         return send_file(file_path, as_attachment=True)
     else:
-        print(f"Error: Audio file not found: {file_path}")
+        logger.error(f"Error: Audio file not found: {file_path}")
         return jsonify({'error': 'Ses dosyası bulunamadı'}), 404
 
 @app.route('/share/<video_id>/<lang>')
