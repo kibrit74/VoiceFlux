@@ -4,21 +4,26 @@ import time
 import random
 import logging
 from flask import Flask, render_template, request, jsonify, send_file, url_for
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, TooManyRequests
 import google.generativeai as genai
 from gtts import gTTS
 from functools import wraps
 from cachetools import TTLCache, cached
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
+CORS(app)
 
 # Logging ayarları
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Google Gemini API anahtarını çevresel değişkenlerden alın
-genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
+genai.configure(api_key=os.environ.get('GOOGLE_GEMINI_API_KEY', 'YOUR_DEFAULT_API_KEY'))
 
 # Geçici ses dosyaları için dizin
 TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
@@ -27,9 +32,22 @@ os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 # Önbellek ayarları
 transcript_cache = TTLCache(maxsize=1000, ttl=3600)  # 1 saat süreyle 1000 öğe sakla
 
+def requests_retry_session(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504), session=None):
+    session = session or requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
 def exponential_backoff(attempt, base_delay=5, max_delay=300):
-    delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
-    return delay
+    return min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
 
 def retry_with_backoff(retries=5):
     def decorator(func):
@@ -77,7 +95,7 @@ def translate_text(text, target_language):
     Görev: Aşağıdaki metni {target_language} diline çevir.
 
     Kaynak Metin:
-    {text}
+    {text[:1000]}  # İlk 1000 karakter ile sınırla
 
     Hedef Dil: {target_language}
 
@@ -95,8 +113,12 @@ def translate_text(text, target_language):
 
     Çevrilmiş Metin:
     """
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Çeviri hatası: {e}")
+        return None
 
 def get_language_code(language):
     language_codes = {
@@ -139,6 +161,9 @@ def translate():
     if transcript:
         try:
             translated_text = translate_text(transcript, target_language)
+            if translated_text is None:
+                return jsonify({'error': 'Çeviri yapılamadı'}), 500
+            
             audio_filename = f"{video_id}_{int(time.time())}.mp3"
             audio_path = text_to_speech(translated_text, audio_filename, target_language)
             
