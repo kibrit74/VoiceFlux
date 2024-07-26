@@ -1,11 +1,12 @@
 import os
 import re
 import time
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, url_for
 from werkzeug.utils import secure_filename
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import google.generativeai as genai
 from gtts import gTTS
+from functools import wraps
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -14,21 +15,41 @@ genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
 
 # Geçici ses dosyaları için dizin
 TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
-if not os.path.exists(TEMP_AUDIO_DIR):
-    os.makedirs(TEMP_AUDIO_DIR)
+os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
+
+def rate_limited(max_per_second):
+    min_interval = 1.0 / float(max_per_second)
+    def decorate(func):
+        last_time_called = [0.0]
+        @wraps(func)
+        def rate_limited_function(*args, **kwargs):
+            elapsed = time.time() - last_time_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_time_called[0] = time.time()
+            return ret
+        return rate_limited_function
+    return decorate
 
 def extract_video_id(url):
     pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(.{11})'
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
+@rate_limited(1)  # Saniyede maksimum 1 istek
 def get_youtube_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return ' '.join([entry['text'] for entry in transcript])
+    except TranscriptsDisabled:
+        print(f"Video {video_id} için transkript devre dışı bırakılmış.")
+    except NoTranscriptFound:
+        print(f"Video {video_id} için transkript bulunamadı.")
     except Exception as e:
-        print(f"Transkript alınamadı: {e}")
-        return None
+        print(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
+    return None
 
 def translate_text(text, target_language):
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -54,7 +75,6 @@ def translate_text(text, target_language):
 
     Çevrilmiş Metin:
     """
-    
     response = model.generate_content(prompt)
     return response.text
 
@@ -128,6 +148,7 @@ def serve_audio(filename):
     else:
         print(f"Error: Audio file not found: {file_path}")
         return jsonify({'error': 'Ses dosyası bulunamadı'}), 404
+
 @app.route('/share/<video_id>/<lang>')
 def share_video(video_id, lang):
     return render_template('result.html', video_id=video_id, lang=lang)
