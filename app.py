@@ -1,12 +1,13 @@
 import os
 import re
 import time
+import random
 from flask import Flask, render_template, request, jsonify, send_file, url_for
 from werkzeug.utils import secure_filename
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import google.generativeai as genai
 from gtts import gTTS
-from functools import wraps
+from functools import wraps, lru_cache
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -17,28 +18,32 @@ genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
 TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
-def rate_limited(max_per_second):
-    min_interval = 1.0 / float(max_per_second)
-    def decorate(func):
-        last_time_called = [0.0]
+def exponential_backoff(attempt):
+    return min(300, (2 ** attempt) + random.random())
+
+def retry_with_backoff(retries=3):
+    def decorator(func):
         @wraps(func)
-        def rate_limited_function(*args, **kwargs):
-            elapsed = time.time() - last_time_called[0]
-            left_to_wait = min_interval - elapsed
-            if left_to_wait > 0:
-                time.sleep(left_to_wait)
-            ret = func(*args, **kwargs)
-            last_time_called[0] = time.time()
-            return ret
-        return rate_limited_function
-    return decorate
+        def wrapper(*args, **kwargs):
+            for attempt in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == retries - 1:
+                        raise e
+                    wait_time = exponential_backoff(attempt)
+                    print(f"Attempt {attempt + 1} failed. Waiting for {wait_time:.2f} seconds.")
+                    time.sleep(wait_time)
+        return wrapper
+    return decorator
 
 def extract_video_id(url):
     pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(.{11})'
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
-@rate_limited(1)  # Saniyede maksimum 1 istek
+@retry_with_backoff(retries=3)
+@lru_cache(maxsize=100)
 def get_youtube_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
