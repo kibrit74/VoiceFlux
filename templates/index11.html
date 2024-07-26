@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Transcript Arama</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-5">YouTube Video Transcript Arama</h1>
+        <form id="search-form" class="mt-4">
+            <div class="form-group">
+                <label for="query">Arama Terimi:</label>
+                <input type="text" class="form-control" id="query" placeholder="Örneğin, samsung 24+">
+            </div>
+            <button type="submit" class="btn btn-primary">Ara</button>
+        </form>
+        <div id="result" class="mt-4"></div>
+    </div>
+
+    <script>
+        document.getElementById('search-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const query = document.getElementById('query').value;
+            const response = await fetch('/transcript', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ query })
+            });
+            const result = await response.json();
+            if (result.error) {
+                document.getElementById('result').innerHTML = `<div class="alert alert-danger">${result.error}</div>`;
+            } else {
+                document.getElementById('result').innerHTML = `
+                    <div class="alert alert-success">Transcript dosyası: <a href="/static/${result.transcript_file}" target="_blank">${result.transcript_file}</a></div>
+                `;
+            }
+        });
+    </script>
+</body>
+</html>

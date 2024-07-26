@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Çeviri ve Seslendirme</title>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 650px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+        }
+        #player, #audioPlayer {
+            display: none;
+            margin-top: 20px;
+        }
+        .button {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 15px 32px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        .button:hover {
+            background-color: #45a049;
+        }
+        #pauseButton {
+            background-color: #f44336;
+        }
+        #pauseButton:hover {
+            background-color: #d32f2f;
+        }
+        #loadingMessage {
+            font-size: 18px;
+            color: #666;
+            margin-top: 20px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        #infoMessage {
+            margin-top: 20px;
+            font-size: 16px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>YouTube Video Çevirisi</h1>
+        <div id="loadingMessage">
+            <p>İşlem Başlıyor...</p>
+            <div class="spinner"></div>
+        </div>
+        <div id="infoMessage" hidden>
+            <p id="transcriptMessage">Transkript alınıyor...</p>
+            <p id="translateMessage" hidden>Metin Türkçeye çevriliyor...</p>
+            <p id="speechMessage" hidden>Ses dosyası oluşturuluyor...</p>
+            <p id="bekleMessage" hidden>İnternet bağlantınızın hızına ve videonun büyüklüğüne göre işlem süresi değişebilir. Lütfen bekleyiniz.</p>
+        </div>
+        <div id="player"></div>
+        <audio id="audioPlayer" hidden>
+            <source src="" type="audio/mpeg">
+        </audio>
+        <button id="playButton" class="button" style="display: none;">Oynat</button>
+        <button id="pauseButton" class="button" style="display: none;">Duraklat</button>
+    </div>
+
+    <script>
+        var player;
+        var audioPlayer;
+        var chunks = [];
+        var isTranslationStarted = false;
+        var isPlaying = false;
+
+        function onYouTubeIframeAPIReady() {
+            var videoUrl = new URLSearchParams(window.location.search).get('video_url');
+            if (!videoUrl) {
+                alert("Video URL'si bulunamadı.");
+                return;
+            }
+
+            $.ajax({
+                type: "POST",
+                url: "/translate",
+                data: { video_url: videoUrl },
+                success: function(response) {
+                    if (response.error) {
+                        alert(response.error);
+                    } else {
+                        showMessagesSequentially(response.video_id, response.audio_file, response.chunks);
+                    }
+                },
+                error: function() {
+                    alert("Çeviri işlemi sırasında bir hata oluştu.");
+                }
+            });
+        }
+
+        function showMessagesSequentially(videoId, audioFile, chunkData) {
+            $('#infoMessage').show();
+            
+            setTimeout(function() {
+                $('#transcriptMessage').show();
+            }, 1000);
+
+            setTimeout(function() {
+                $('#transcriptMessage').hide();
+                $('#translateMessage').show();
+            }, 3000);
+
+            setTimeout(function() {
+                $('#translateMessage').hide();
+                $('#speechMessage').show();
+            }, 5000);
+
+            setTimeout(function() {
+                $('#speechMessage').hide();
+                $('#bekleMessage').show();
+            }, 7000);
+
+            setTimeout(function() {
+                $('#infoMessage').hide();
+                initializePlayer(videoId, audioFile, chunkData);
+            }, 9000);
+        }
+
+        function initializePlayer(videoId, audioFile, chunkData) {
+            chunks = chunkData;
+            player = new YT.Player('player', {
+                height: '360',
+                width: '640',
+                videoId: videoId,
+                events: {
+                    'onReady': function() { onPlayerReady(audioFile); },
+                    'onStateChange': onPlayerStateChange
+                }
+            });
+            audioPlayer = document.getElementById('audioPlayer');
+        }
+
+        function onPlayerReady(audioFile) {
+            var audioFilePath = '/static/' + audioFile;
+            audioPlayer.src = audioFilePath;
+            audioPlayer.load();
+            audioPlayer.playbackRate = 1.00;
+            isTranslationStarted = true;
+            showPlayButton();
+        }
+
+        function onPlayerStateChange(event) {
+            if (event.data == YT.PlayerState.PLAYING) {
+                audioPlayer.play();
+                isPlaying = true;
+            } else if (event.data == YT.PlayerState.PAUSED) {
+                audioPlayer.pause();
+                isPlaying = false;
+            }
+        }
+
+        function showPlayButton() {
+            $('#loadingMessage').hide();
+            $('#player').show();
+            $('#playButton').show();
+            $('#pauseButton').show();
+        }
+
+        function syncAudioWithVideo() {
+            var currentTime = player.getCurrentTime();
+            var currentChunk = chunks.find(chunk => chunk.start <= currentTime && currentTime < chunk.start + chunk.duration);
+            
+            if (currentChunk) {
+                var audioTime = chunks.slice(0, chunks.indexOf(currentChunk)).reduce((sum, chunk) => sum + chunk.duration, 0);
+                audioTime += currentTime - currentChunk.start;
+                
+                if (Math.abs(audioPlayer.currentTime - audioTime) > 0.5) {
+                    audioPlayer.currentTime = audioTime;
+                }
+            }
+        }
+
+        $(document).ready(function() {
+            $('#playButton').on('click', function() {
+                if (isTranslationStarted) {
+                    player.playVideo();
+                    audioPlayer.play();
+                    isPlaying = true;
+                } else {
+                    alert("Çeviri henüz hazır değil. Lütfen bekleyin.");
+                }
+            });
+
+            $('#pauseButton').on('click', function() {
+                player.pauseVideo();
+                audioPlayer.pause();
+                isPlaying = false;
+            });
+
+            audioPlayer.addEventListener('timeupdate', function() {
+                var currentTime = audioPlayer.currentTime;
+                var duration = audioPlayer.duration;
+                if (currentTime >= duration) {
+                    player.stopVideo();
+                    isPlaying = false;
+                }
+            });
+
+            setInterval(function() {
+                if (isPlaying) {
+                    syncAudioWithVideo();
+                }
+            }, 1000); // Her saniye senkronizasyonu kontrol et
+        });
+    </script>
+</body>
+</html>
