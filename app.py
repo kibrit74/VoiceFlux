@@ -8,6 +8,8 @@ import urllib.parse
 from flask import Flask, render_template, request, jsonify, send_file
 from gtts import gTTS
 import google.generativeai as genai
+from functools import lru_cache
+from urllib.error import HTTPError
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -18,6 +20,10 @@ genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
 
 TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
+
+# İstek hızı sınırlama için değişkenler
+RATE_LIMIT = 1  # saniyede maksimum istek sayısı
+last_request_time = 0
 
 def extract_video_id(url):
     patterns = [
@@ -31,35 +37,63 @@ def extract_video_id(url):
             return match.group(1)
     return url if len(url) == 11 else None
 
-def get_youtube_transcript(video_id):
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        html = urllib.request.urlopen(url).read().decode('utf-8')
-        
-        data_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;\s*</script>', html)
-        if not data_match:
+@lru_cache(maxsize=100)
+def cached_get_youtube_transcript(video_id):
+    return _get_youtube_transcript(video_id)
+
+def rate_limited_get_youtube_transcript(video_id):
+    global last_request_time
+    current_time = time.time()
+    time_since_last_request = current_time - last_request_time
+    
+    if time_since_last_request < 1 / RATE_LIMIT:
+        time.sleep(1 / RATE_LIMIT - time_since_last_request)
+    
+    last_request_time = time.time()
+    return cached_get_youtube_transcript(video_id)
+
+def _get_youtube_transcript(video_id):
+    max_retries = 3
+    retry_delay = 5  # saniye
+
+    for attempt in range(max_retries):
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            html = urllib.request.urlopen(url).read().decode('utf-8')
+            
+            data_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;\s*</script>', html)
+            if not data_match:
+                return None
+            
+            data = json.loads(data_match.group(1))
+            captions = data['captions']['playerCaptionsTracklistRenderer']['captionTracks']
+            
+            if not captions:
+                return None
+            
+            caption_url = captions[0]['baseUrl']
+            caption_data = urllib.request.urlopen(caption_url).read().decode('utf-8')
+            
+            transcript = []
+            for line in caption_data.split('\n'):
+                if re.match(r'\d+:\d+:\d+\.\d+,\d+:\d+:\d+\.\d+', line):
+                    continue
+                if line.strip():
+                    transcript.append(line.strip())
+            
+            return ' '.join(transcript)
+        except HTTPError as e:
+            if e.code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2 ** attempt))  # Üstel geri çekilme
+                    continue
+            raise
+        except Exception as e:
+            logger.error(f"Transkript alınırken hata oluştu: {str(e)}")
             return None
-        
-        data = json.loads(data_match.group(1))
-        captions = data['captions']['playerCaptionsTracklistRenderer']['captionTracks']
-        
-        if not captions:
-            return None
-        
-        caption_url = captions[0]['baseUrl']
-        caption_data = urllib.request.urlopen(caption_url).read().decode('utf-8')
-        
-        transcript = []
-        for line in caption_data.split('\n'):
-            if re.match(r'\d+:\d+:\d+\.\d+,\d+:\d+:\d+\.\d+', line):
-                continue
-            if line.strip():
-                transcript.append(line.strip())
-        
-        return ' '.join(transcript)
-    except Exception as e:
-        logger.error(f"Transkript alınırken hata oluştu: {str(e)}")
-        return None
+
+    raise Exception("Maksimum yeniden deneme sayısına ulaşıldı")
+
 @app.route('/translate', methods=['POST'])
 def translate():
     video_url = request.form['video_url']
@@ -70,7 +104,7 @@ def translate():
         return jsonify({'error': 'Geçersiz YouTube URL\'si veya video ID\'si'}), 400
     
     try:
-        transcript = get_youtube_transcript(video_id)
+        transcript = rate_limited_get_youtube_transcript(video_id)
         
         if transcript:
             translated_text = translate_text(transcript, target_language)
@@ -89,7 +123,8 @@ def translate():
             return jsonify({'error': 'Transkript alınamadı veya video altyazı içermiyor'}), 500
     except Exception as e:
         logger.error(f"İşlem sırasında bir hata oluştu: {e}")
-        return jsonify({'error': 'İşlem sırasında bir hata oluştu'}), 500
+        return jsonify({'error': 'İşlem sırasında bir hata oluştu. Lütfen daha sonra tekrar deneyin.'}), 500
+
 def translate_text(text, target_language):
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
@@ -135,36 +170,6 @@ def text_to_speech(text, output_file, target_language):
 @app.route('/')
 def index():
     return render_template('index111.html')
-
-def get_youtube_transcript(video_id):
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        html = urllib.request.urlopen(url).read().decode('utf-8')
-        
-        data_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;\s*</script>', html)
-        if not data_match:
-            return None
-        
-        data = json.loads(data_match.group(1))
-        captions = data['captions']['playerCaptionsTracklistRenderer']['captionTracks']
-        
-        if not captions:
-            return None
-        
-        caption_url = captions[0]['baseUrl']
-        caption_data = urllib.request.urlopen(caption_url).read().decode('utf-8')
-        
-        transcript = []
-        for line in caption_data.split('\n'):
-            if re.match(r'\d+:\d+:\d+\.\d+,\d+:\d+:\d+\.\d+', line):
-                continue
-            if line.strip():
-                transcript.append(line.strip())
-        
-        return ' '.join(transcript)
-    except Exception as e:
-        logger.error(f"Transkript alınırken hata oluştu: {str(e)}")
-        return None
 
 @app.route('/static/temp_audio/<path:filename>')
 def serve_audio(filename):
