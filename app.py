@@ -77,11 +77,11 @@ class YouTubeTranscriptApi:
         except Exception as e:
             raise Exception(f"Transkript alınırken bir hata oluştu: {str(e)}")
 
-def exponential_backoff(attempt, base_delay=5, max_delay=300):
-    delay = min(max_delay, (base_delay * (2 ** attempt)) + (random.random() * 5))
+def exponential_backoff(attempt, base_delay=10, max_delay=1200):
+    delay = min(max_delay, (base_delay * (2 ** attempt)) + (random.random() * 10))
     return delay
 
-def retry_with_backoff(retries=5, base_delay=5, max_delay=300):
+def retry_with_backoff(retries=10, base_delay=10, max_delay=1200):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -112,7 +112,7 @@ def extract_video_id(url_or_id):
     else:
         raise ValueError("Geçersiz YouTube URL'si veya video ID'si")
 
-@retry_with_backoff(retries=5, base_delay=10, max_delay=600)
+@retry_with_backoff(retries=10, base_delay=10, max_delay=1200)
 @cached(cache=transcript_cache)
 def get_youtube_transcript(video_id):
     try:
