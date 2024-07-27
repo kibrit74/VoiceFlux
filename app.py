@@ -129,12 +129,6 @@ def get_youtube_transcript(video_id):
         logger.error(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
     return None
 
-# translate_text, get_language_code, ve text_to_speech fonksiyonları aynı kalıyor
-
-@app.route('/')
-def index():
-    return render_template('index111.html')
-
 def translate_text(text, target_language):
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
@@ -168,6 +162,7 @@ def get_language_code(language):
         'Çince': 'zh-cn', 'Korece': 'ko'
     }
     return language_codes.get(language, 'en')
+
 def text_to_speech(text, output_file, target_language):
     lang_code = get_language_code(target_language)
     tts = gTTS(text=text[:5000], lang=lang_code)  # İlk 5000 karakter ile sınırla
@@ -175,6 +170,10 @@ def text_to_speech(text, output_file, target_language):
     tts.save(file_path)
     logger.info(f"Ses dosyası kaydedildi: {file_path}")
     return file_path
+
+@app.route('/')
+def index():
+    return render_template('index111.html')
 
 @app.route('/translate', methods=['POST'])
 def translate():
@@ -209,8 +208,6 @@ def translate():
     except Exception as e:
         logger.error(f"İşlem sırasında bir hata oluştu: {e}")
         return jsonify({'error': 'İşlem sırasında bir hata oluştu'}), 500
-
-# serve_audio, share_video, ve result rotaları aynı kalıyor
 
 if __name__ == "__main__":
     app.run(debug=True)
