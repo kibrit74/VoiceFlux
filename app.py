@@ -133,7 +133,51 @@ def get_youtube_transcript(video_id):
         logger.error(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
     return None
 
-# ... (diğer fonksiyonlar aynı kalıyor)
+def translate_text(text, target_language):
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    prompt = f"""
+    Görev: Aşağıdaki metni {target_language} diline çevir.
+
+    Kaynak Metin:
+    {text[:4000]}  # İlk 4000 karakter ile sınırla
+
+    Hedef Dil: {target_language}
+
+    Çeviri Yönergeleri:
+    1. Metni akıcı ve doğal bir {target_language} diline çevir.
+    2. Orijinal metnin anlamını ve tonunu koru.
+    3. Teknik terimleri ve özel isimleri uygun şekilde ele al.
+    4. Kültürel referansları hedef dile uyarla.
+    5. Tutarlı bir dil ve üslup kullan.
+
+    Çevrilmiş Metin:
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Çeviri hatası: {e}")
+        return None
+
+def get_language_code(language):
+    language_codes = {
+        'Türkçe': 'tr', 'İngilizce': 'en', 'Almanca': 'de', 'Fransızca': 'fr',
+        'İspanyolca': 'es', 'İtalyanca': 'it', 'Rusça': 'ru', 'Japonca': 'ja',
+        'Çince': 'zh-cn', 'Korece': 'ko'
+    }
+    return language_codes.get(language, 'en')
+
+def text_to_speech(text, output_file, target_language):
+    lang_code = get_language_code(target_language)
+    tts = gTTS(text=text[:5000], lang=lang_code)  # İlk 5000 karakter ile sınırla
+    file_path = os.path.join(TEMP_AUDIO_DIR, output_file)
+    tts.save(file_path)
+    logger.info(f"Ses dosyası kaydedildi: {file_path}")
+    return file_path
+
+@app.route('/')
+def index():
+    return render_template('index111.html')
 
 @app.route('/translate', methods=['POST'])
 def translate():
@@ -168,6 +212,25 @@ def translate():
     except Exception as e:
         logger.error(f"İşlem sırasında bir hata oluştu: {e}")
         return jsonify({'error': 'İşlem sırasında bir hata oluştu'}), 500
+
+@app.route('/static/temp_audio/<path:filename>')
+def serve_audio(filename):
+    file_path = os.path.join(TEMP_AUDIO_DIR, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    else:
+        return jsonify({'error': 'Ses dosyası bulunamadı'}), 404
+
+@app.route('/share/<video_id>/<lang>')
+def share_video(video_id, lang):
+    return render_template('result.html', video_id=video_id, lang=lang)
+
+@app.route('/result')
+def result():
+    video_id = request.args.get('video_id')
+    lang = request.args.get('lang')
+    audio_file = request.args.get('audio_file')
+    return render_template('result.html', video_id=video_id, lang=lang, audio_file=audio_file)
 
 if __name__ == "__main__":
     app.run(debug=True)
