@@ -3,21 +3,22 @@ import re
 import time
 import random
 import logging
-from flask import Flask, render_template, request, jsonify, send_file, url_for
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, TooManyRequests
-import google.generativeai as genai
-from gtts import gTTS
-from functools import wraps
 from cachetools import TTLCache, cached
+from functools import wraps
+from gtts import gTTS
+import google.generativeai as genai
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
 # Logging ayarları
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Google Gemini API anahtarını çevresel değişkenlerden alın
 genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
 
 # Geçici ses dosyaları için dizin
@@ -26,6 +27,68 @@ os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
 # Önbellek ayarları
 transcript_cache = TTLCache(maxsize=1000, ttl=3600)  # 1 saat süreyle 1000 öğe sakla
+
+class TranscriptsDisabled(Exception):
+    pass
+
+class NoTranscriptAvailable(Exception):
+    pass
+
+class YouTubeTranscriptApi:
+    @staticmethod
+    def get_transcript(video_id):
+        try:
+            # Video sayfasını al
+            video_url = f'https://www.youtube.com/watch?v={video_id}'
+            html = urllib.request.urlopen(video_url).read().decode('utf-8')
+            
+            # Transkript URL'sini bul
+            caption_url_regex = r'"captionTracks":\[.*?"baseUrl":"(.*?)"'
+            caption_url_match = re.search(caption_url_regex, html, re.DOTALL)
+            
+            if not caption_url_match:
+                raise TranscriptsDisabled("Bu video için transkriptler devre dışı bırakılmış.")
+            
+            caption_url = caption_url_match.group(1)
+            caption_url = caption_url.replace('\\u0026', '&')
+            
+            # Transkript XML'ini indir ve parse et
+            xml = urllib.request.urlopen(caption_url).read().decode('utf-8')
+            root = ET.fromstring(xml)
+            
+            # Transkript metnini ve zaman damgalarını birleştir
+            transcript = []
+            for element in root.findall('.//text'):
+                start = float(element.get('start'))
+                duration = float(element.get('dur')) if element.get('dur') else 0
+                text = element.text
+                transcript.append({
+                    'text': text,
+                    'start': start,
+                    'duration': duration
+                })
+            
+            if not transcript:
+                raise NoTranscriptAvailable("Bu video için transkript mevcut değil.")
+            
+            return transcript
+        except TranscriptsDisabled:
+            raise
+        except NoTranscriptAvailable:
+            raise
+        except Exception as e:
+            raise Exception(f"Transkript alınırken bir hata oluştu: {str(e)}")
+
+def extract_video_id(url_or_id):
+    # YouTube URL'sinden video ID'sini çıkar
+    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url_or_id)
+    if match:
+        return match.group(1)
+    # Eğer zaten bir video ID ise, olduğu gibi döndür
+    elif len(url_or_id) == 11:
+        return url_or_id
+    else:
+        raise ValueError("Geçersiz YouTube URL'si veya video ID'si")
 
 def exponential_backoff(attempt, base_delay=5, max_delay=300):
     delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
@@ -48,11 +111,6 @@ def retry_with_backoff(retries=5):
         return wrapper
     return decorator
 
-def extract_video_id(url):
-    pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(.{11})'
-    match = re.search(pattern, url)
-    return match.group(1) if match else None
-
 @retry_with_backoff(retries=5)
 @cached(cache=transcript_cache)
 def get_youtube_transcript(video_id):
@@ -60,15 +118,11 @@ def get_youtube_transcript(video_id):
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return ' '.join([entry['text'] for entry in transcript])
     except TranscriptsDisabled:
-        logger.warning(f"Video {video_id} için transkript devre dışı bırakılmış.")
-    except NoTranscriptFound:
-        logger.warning(f"Video {video_id} için transkript bulunamadı.")
-    except VideoUnavailable:
-        logger.warning(f"Video {video_id} mevcut değil veya özel.")
-    except TooManyRequests:
-        logger.error("YouTube API istek limitine ulaşıldı.")
+        logger.warning(f"Transcripts are disabled for video {video_id}")
+    except NoTranscriptAvailable:
+        logger.warning(f"No transcript available for video {video_id}")
     except Exception as e:
-        logger.error(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
+        logger.error(f"Unexpected error while fetching transcript: {e}")
     return None
 
 def translate_text(text, target_language):
@@ -77,26 +131,25 @@ def translate_text(text, target_language):
     Görev: Aşağıdaki metni {target_language} diline çevir.
 
     Kaynak Metin:
-    {text}
+    {text[:4000]}  # İlk 4000 karakter ile sınırla
 
     Hedef Dil: {target_language}
 
     Çeviri Yönergeleri:
     1. Metni akıcı ve doğal bir {target_language} diline çevir.
-    2. Orijinal metnin anlamını ve tonunu koruyarak çeviri yap.
-    3. Teknik terimleri veya özel isimleri uygun şekilde ele al; gerektiğinde parantez içinde açıklama ekle.
-    4. Kültürel referansları hedef dilin kültürüne uygun şekilde uyarla, ancak orijinal anlamı kaybetme.
-    5. Deyimler ve atasözlerini hedef dildeki eşdeğerleriyle değiştir.
-    6. Cümle yapılarını hedef dilin gramer kurallarına uygun olacak şekilde yeniden düzenle.
-    7. Çeviride tutarlı bir dil ve üslup kullan.
-    8. Hedef dilin resmi veya günlük kullanımına uygun bir dil seviyesi seç.
-    9. Gerektiğinde, kaynak dildeki belirsiz ifadeleri netleştir.
-    10. Çevirinin doğruluğundan emin olmadığın kısımları [?] işareti ile belirt.
+    2. Orijinal metnin anlamını ve tonunu koru.
+    3. Teknik terimleri ve özel isimleri uygun şekilde ele al.
+    4. Kültürel referansları hedef dile uyarla.
+    5. Tutarlı bir dil ve üslup kullan.
 
     Çevrilmiş Metin:
     """
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return None
 
 def get_language_code(language):
     language_codes = {
@@ -108,17 +161,10 @@ def get_language_code(language):
 
 def text_to_speech(text, output_file, target_language):
     lang_code = get_language_code(target_language)
-    tts = gTTS(text=text, lang=lang_code)
+    tts = gTTS(text=text[:5000], lang=lang_code)  # İlk 5000 karakter ile sınırla
     file_path = os.path.join(TEMP_AUDIO_DIR, output_file)
     tts.save(file_path)
-    logger.info(f"Ses dosyası {file_path} olarak kaydedildi.")
-    
-    if os.path.exists(file_path):
-        logger.info(f"Dosya başarıyla oluşturuldu: {file_path}")
-        logger.info(f"Dosya boyutu: {os.path.getsize(file_path)} bytes")
-    else:
-        logger.error(f"Hata: Dosya oluşturulamadı: {file_path}")
-    
+    logger.info(f"Audio file saved as {file_path}")
     return file_path
 
 @app.route('/')
@@ -129,24 +175,22 @@ def index():
 def translate():
     video_url = request.form['video_url']
     target_language = request.form['target_language']
-    video_id = extract_video_id(video_url)
     
-    if not video_id:
-        return jsonify({'error': 'Geçersiz YouTube URL\'si'}), 400
+    try:
+        video_id = extract_video_id(video_url)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     
     transcript = get_youtube_transcript(video_id)
     
     if transcript:
         try:
             translated_text = translate_text(transcript, target_language)
+            if translated_text is None:
+                return jsonify({'error': 'Translation failed'}), 500
+            
             audio_filename = f"{video_id}_{int(time.time())}.mp3"
             audio_path = text_to_speech(translated_text, audio_filename, target_language)
-            
-            full_audio_path = os.path.join(app.root_path, 'static', 'temp_audio', audio_filename)
-            if os.path.exists(full_audio_path):
-                logger.info(f"Ses dosyası mevcut: {full_audio_path}")
-            else:
-                logger.error(f"Hata: Ses dosyası bulunamadı: {full_audio_path}")
             
             return jsonify({
                 'video_id': video_id,
@@ -154,20 +198,18 @@ def translate():
                 'target_language': target_language
             })
         except Exception as e:
-            logger.error(f"Çeviri veya ses dönüşümü hatası: {e}")
-            return jsonify({'error': 'Çeviri işlemi sırasında bir hata oluştu'}), 500
+            logger.error(f"Error during translation or speech conversion: {e}")
+            return jsonify({'error': 'An error occurred during processing'}), 500
     else:
-        return jsonify({'error': 'Transkript alınamadı veya video altyazı içermiyor'}), 500
+        return jsonify({'error': 'Unable to fetch transcript or video has no captions'}), 500
 
 @app.route('/static/temp_audio/<path:filename>')
 def serve_audio(filename):
     file_path = os.path.join(TEMP_AUDIO_DIR, filename)
     if os.path.exists(file_path):
-        logger.info(f"Serving audio file: {file_path}")
         return send_file(file_path, as_attachment=True)
     else:
-        logger.error(f"Error: Audio file not found: {file_path}")
-        return jsonify({'error': 'Ses dosyası bulunamadı'}), 404
+        return jsonify({'error': 'Audio file not found'}), 404
 
 @app.route('/share/<video_id>/<lang>')
 def share_video(video_id, lang):
