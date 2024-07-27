@@ -129,6 +129,10 @@ def get_youtube_transcript(video_id):
         logger.error(f"Transkript alınırken beklenmeyen bir hata oluştu: {e}")
     return None
 
+@app.route('/')
+def index():
+    return render_template('index111.html')
+
 def translate_text(text, target_language):
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
@@ -170,10 +174,6 @@ def text_to_speech(text, output_file, target_language):
     tts.save(file_path)
     logger.info(f"Ses dosyası kaydedildi: {file_path}")
     return file_path
-
-@app.route('/')
-def index():
-    return render_template('index111.html')
 
 @app.route('/translate', methods=['POST'])
 def translate():
