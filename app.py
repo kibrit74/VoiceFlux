@@ -1,13 +1,21 @@
+# app.py
 from flask import Flask, render_template, request, jsonify
 import google.generativeai as genai
 import yt_dlp
 import os
 from gtts import gTTS
-import time
-from werkzeug.serving import run_simple
+from celery import Celery
+from flask_caching import Cache
 
 app = Flask(__name__)
-app.config['TIMEOUT'] = 300  # 5 dakika
+app.config['CACHE_TYPE'] = 'simple'
+cache = Cache(app)
+
+# Celery yapılandırması
+app.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'
+app.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'
+celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
+celery.conf.update(app.config)
 
 # Sabit değer
 GEMINI_API_KEY = "AIzaSyCocxsiyfBAOQXzInSoJU70M5PDzDmJA38"  # Gerçek API anahtarınızı buraya yazın
@@ -52,21 +60,17 @@ def clean_transcript(content):
             cleaned_lines.append(line.strip())
     return ' '.join(cleaned_lines)
 
-def summarize_with_gemini(text, target_language, max_retries=3):
+def summarize_with_gemini(text, target_language):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"Translate the following English text to {target_language}, focusing only on the spoken content. Provide a meaningful and coherent translation without using special characters like # or *:\n\n{text}"
     
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            print(f"Gemini işleme hatası (Deneme {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(5)  # 5 saniye bekle ve tekrar dene
-            else:
-                return None
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"Gemini işleme hatası: {str(e)}")
+        return None
 
 def text_to_speech(text, output_file):
     try:
@@ -77,6 +81,27 @@ def text_to_speech(text, output_file):
         print(f"Ses dosyası oluşturma hatası: {str(e)}")
         return None
 
+@celery.task
+def process_video(video_url, target_language):
+    transcript = download_transcript(video_url)
+    if not transcript:
+        return {"error": "Transkript indirilemedi."}
+
+    summary = summarize_with_gemini(transcript, target_language)
+    if not summary:
+        return {"error": "Özet oluşturulamadı."}
+
+    audio_file = f'static/audio/summary_{os.urandom(16).hex()}.mp3'
+    if not text_to_speech(summary, audio_file):
+        return {"error": "Sesli özet oluşturulamadı."}
+
+    video_id = video_url.split('v=')[1]
+    return {
+        "video_id": video_id,
+        "audio_file": audio_file,
+        "summary": summary
+    }
+
 @app.route('/')
 def index():
     return render_template('index111.html')
@@ -86,33 +111,30 @@ def translate():
     video_url = request.form['video_url']
     target_language = request.form['target_language']
     
-    transcript = download_transcript(video_url)
-    if not transcript:
-        return jsonify({"error": "Transkript indirilemedi."}), 400
+    task = process_video.delay(video_url, target_language)
+    return jsonify({"task_id": task.id}), 202
 
-    summary = summarize_with_gemini(transcript, target_language)
-    if not summary:
-        return jsonify({"error": "Özet oluşturulamadı."}), 400
-
-    audio_file = f'static/audio/summary_{os.urandom(16).hex()}.mp3'
-    if not text_to_speech(summary, audio_file):
-        return jsonify({"error": "Sesli özet oluşturulamadı."}), 400
-
-    video_id = video_url.split('v=')[1]
-    return jsonify({
-        "video_id": video_id,
-        "audio_file": audio_file,
-        "summary": summary
-    })
-
-@app.route('/result')
-def result():
-    video_id = request.args.get('video_id')
-    audio_file = request.args.get('audio_file')
-    target_language = request.args.get('target_language')
-    return render_template('result.html', video_id=video_id, audio_file=audio_file, target_language=target_language)
+@app.route('/status/<task_id>')
+def task_status(task_id):
+    task = process_video.AsyncResult(task_id)
+    if task.state == 'PENDING':
+        response = {
+            'state': task.state,
+            'status': 'Görev işleme alındı...'
+        }
+    elif task.state != 'FAILURE':
+        response = {
+            'state': task.state,
+            'status': task.info.get('status', '')
+        }
+        if 'result' in task.info:
+            response['result'] = task.info['result']
+    else:
+        response = {
+            'state': task.state,
+            'status': str(task.info)
+        }
+    return jsonify(response)
 
 if __name__ == '__main__':
-    if not os.path.exists('static/audio'):
-        os.makedirs('static/audio')
-    run_simple('localhost', 5000, app, use_reloader=True, use_debugger=True, threaded=True)
+    app.run(debug=False)
