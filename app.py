@@ -1,106 +1,81 @@
-import os
-import re
-import json
-import time
-import logging
-import urllib.request
-from flask import Flask, render_template, request, jsonify, send_file
-from gtts import gTTS
+from flask import Flask, render_template, request, jsonify
 import google.generativeai as genai
+import yt_dlp
+import os
+from gtts import gTTS
+import time
+from werkzeug.serving import run_simple
 
-app = Flask(__name__, static_folder='static', static_url_path='/static')
+app = Flask(__name__)
+app.config['TIMEOUT'] = 300  # 5 dakika
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Sabit değer
+GEMINI_API_KEY = "AIzaSyCocxsiyfBAOQXzInSoJU70M5PDzDmJA38"  # Gerçek API anahtarınızı buraya yazın
 
-genai.configure(api_key="AIzaSyBWC2gp-UjhlnGQgM0S77lftXnSl0uhqQ0")
-
-TEMP_AUDIO_DIR = os.path.join(app.root_path, 'static', 'temp_audio')
-os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
-
-def extract_video_id(url):
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'(?:youtube\.com\/embed\/)([0-9A-Za-z_-]{11})'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return url if len(url) == 11 else None
-
-def get_youtube_transcript(video_id):
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        html = urllib.request.urlopen(url).read().decode('utf-8')
-        
-        data_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;</script>', html)
-        if not data_match:
-            return None
-        
-        data = json.loads(data_match.group(1))
-        captions = data['captions']['playerCaptionsTracklistRenderer']['captionTracks']
-        
-        if not captions:
-            return None
-        
-        caption_url = captions[0]['baseUrl']
-        caption_data = urllib.request.urlopen(caption_url).read().decode('utf-8')
-        
-        transcript = []
-        for line in caption_data.split('\n'):
-            if re.match(r'\d+:\d+:\d+\.\d+,\d+:\d+:\d+\.\d+', line):
-                continue
-            if line.strip():
-                transcript.append(line.strip())
-        
-        return ' '.join(transcript)
-    except Exception as e:
-        logger.error(f"Transkript alınırken hata oluştu: {str(e)}")
-        return None
-
-def translate_text(text, target_language):
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    prompt = f"""
-    Görev: Aşağıdaki metni {target_language} diline çevir.
-
-    Kaynak Metin:
-    {text[:4000]}  # İlk 4000 karakter ile sınırla
-
-    Hedef Dil: {target_language}
-
-    Çeviri Yönergeleri:
-    1. Metni akıcı ve doğal bir {target_language} diline çevir.
-    2. Orijinal metnin anlamını ve tonunu koru.
-    3. Teknik terimleri ve özel isimleri uygun şekilde ele al.
-    4. Kültürel referansları hedef dile uyarla.
-    5. Tutarlı bir dil ve üslup kullan.
-
-    Çevrilmiş Metin:
-    """
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        logger.error(f"Çeviri hatası: {e}")
-        return None
-
-def get_language_code(language):
-    language_codes = {
-        'Türkçe': 'tr', 'İngilizce': 'en', 'Almanca': 'de', 'Fransızca': 'fr',
-        'İspanyolca': 'es', 'İtalyanca': 'it', 'Rusça': 'ru', 'Japonca': 'ja',
-        'Çince': 'zh-cn', 'Korece': 'ko'
+def download_transcript(url):
+    ydl_opts = {
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en'],
+        'skip_download': True,
+        'outtmpl': 'subtitle',
     }
-    return language_codes.get(language, 'en')
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if 'subtitles' in info and 'en' in info['subtitles']:
+                subtitle_url = info['subtitles']['en'][0]['url']
+                ydl.download([subtitle_url])
+                with open('subtitle.en.vtt', 'r', encoding='utf-8') as f:
+                    content = f.read()
+                os.remove('subtitle.en.vtt')
+                return clean_transcript(content)
+            elif 'automatic_captions' in info and 'en' in info['automatic_captions']:
+                subtitle_url = info['automatic_captions']['en'][0]['url']
+                ydl.download([subtitle_url])
+                with open('subtitle.en.vtt', 'r', encoding='utf-8') as f:
+                    content = f.read()
+                os.remove('subtitle.en.vtt')
+                return clean_transcript(content)
+            else:
+                return None
+    except Exception as e:
+        print(f"Transkript indirme hatası: {str(e)}")
+        return None
 
-def text_to_speech(text, output_file, target_language):
-    lang_code = get_language_code(target_language)
-    tts = gTTS(text=text[:5000], lang=lang_code)  # İlk 5000 karakter ile sınırla
-    file_path = os.path.join(TEMP_AUDIO_DIR, output_file)
-    tts.save(file_path)
-    logger.info(f"Ses dosyası kaydedildi: {file_path}")
-    return file_path
+def clean_transcript(content):
+    lines = content.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if '-->' not in line and not line.strip().isdigit() and line.strip() != 'WEBVTT':
+            cleaned_lines.append(line.strip())
+    return ' '.join(cleaned_lines)
+
+def summarize_with_gemini(text, target_language, max_retries=3):
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    prompt = f"Translate the following English text to {target_language}, focusing only on the spoken content. Provide a meaningful and coherent translation without using special characters like # or *:\n\n{text}"
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"Gemini işleme hatası (Deneme {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(5)  # 5 saniye bekle ve tekrar dene
+            else:
+                return None
+
+def text_to_speech(text, output_file):
+    try:
+        tts = gTTS(text=text, lang='tr')
+        tts.save(output_file)
+        return output_file
+    except Exception as e:
+        print(f"Ses dosyası oluşturma hatası: {str(e)}")
+        return None
 
 @app.route('/')
 def index():
@@ -111,50 +86,33 @@ def translate():
     video_url = request.form['video_url']
     target_language = request.form['target_language']
     
-    video_id = extract_video_id(video_url)
-    if not video_id:
-        return jsonify({'error': 'Geçersiz YouTube URL\'si veya video ID\'si'}), 400
-    
-    try:
-        transcript = get_youtube_transcript(video_id)
-        
-        if transcript:
-            translated_text = translate_text(transcript, target_language)
-            if translated_text is None:
-                return jsonify({'error': 'Çeviri başarısız oldu'}), 500
-            
-            audio_filename = f"{video_id}_{int(time.time())}.mp3"
-            audio_path = text_to_speech(translated_text, audio_filename, target_language)
-            
-            return jsonify({
-                'video_id': video_id,
-                'audio_file': f"/static/temp_audio/{audio_filename}",
-                'target_language': target_language
-            })
-        else:
-            return jsonify({'error': 'Transkript alınamadı veya video altyazı içermiyor'}), 500
-    except Exception as e:
-        logger.error(f"İşlem sırasında bir hata oluştu: {e}")
-        return jsonify({'error': 'İşlem sırasında bir hata oluştu'}), 500
+    transcript = download_transcript(video_url)
+    if not transcript:
+        return jsonify({"error": "Transkript indirilemedi."}), 400
 
-@app.route('/static/temp_audio/<path:filename>')
-def serve_audio(filename):
-    file_path = os.path.join(TEMP_AUDIO_DIR, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    else:
-        return jsonify({'error': 'Ses dosyası bulunamadı'}), 404
+    summary = summarize_with_gemini(transcript, target_language)
+    if not summary:
+        return jsonify({"error": "Özet oluşturulamadı."}), 400
 
-@app.route('/share/<video_id>/<lang>')
-def share_video(video_id, lang):
-    return render_template('result.html', video_id=video_id, lang=lang)
+    audio_file = f'static/audio/summary_{os.urandom(16).hex()}.mp3'
+    if not text_to_speech(summary, audio_file):
+        return jsonify({"error": "Sesli özet oluşturulamadı."}), 400
+
+    video_id = video_url.split('v=')[1]
+    return jsonify({
+        "video_id": video_id,
+        "audio_file": audio_file,
+        "summary": summary
+    })
 
 @app.route('/result')
 def result():
     video_id = request.args.get('video_id')
-    lang = request.args.get('lang')
     audio_file = request.args.get('audio_file')
-    return render_template('result.html', video_id=video_id, lang=lang, audio_file=audio_file)
+    target_language = request.args.get('target_language')
+    return render_template('result.html', video_id=video_id, audio_file=audio_file, target_language=target_language)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+if __name__ == '__main__':
+    if not os.path.exists('static/audio'):
+        os.makedirs('static/audio')
+    run_simple('localhost', 5000, app, use_reloader=True, use_debugger=True, threaded=True)
