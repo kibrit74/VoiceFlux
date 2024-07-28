@@ -19,3 +19,5 @@ greenlet==3.0.3
 cachetools==4.2.2
 flask-cors==3.0.10
 yt-dlp>=2023.3.4
+redis==3.5.3
+Flask-Caching==1.10.1
